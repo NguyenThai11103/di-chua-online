@@ -1,14 +1,15 @@
 /**
- * Types for Đi Chùa Online, an interactive relaxation stage for TikTok LIVE
- * Updated to match the "TÂM TỊNH TÂM AN" aesthetic and Vietnamese Buddhist Female Voice.
+ * Shared types for the interactive Đi Chùa Online relaxation experience.
  */
 
 export type MusicTrack = 'chill' | 'niem_phat' | 'sao_truc' | 'khuc_thien_dao';
+export type ReactionEmoji = '🙏' | '👋' | '🪷' | '❤️';
 
 export type GiftCategory = 'dang_huong' | 'le_phat' | 'dang_hoa_sen' | 'qua_dao' | 'ban_tim';
 
 export interface Devotee {
   id: string;
+  presenceId?: string;
   username: string;
   displayName: string;
   avatarUrl?: string;
@@ -16,11 +17,14 @@ export interface Devotee {
   robeColor: string; // colorful traditional áo lam/áo dài
   activeComment?: string;
   commentTimestamp?: number;
+  activeReaction?: ReactionEmoji;
+  reactionTimestamp?: number;
   isVip?: boolean;
   totalDiamonds?: number;
   bowOffset: number;
   seat?: number; // seat index 0..SEAT_COUNT-1 (services/seating.ts), kept while they stay
   lastActive?: number; // last join/comment/gift time; the longest-idle person gives up their seat when the hall is full
+  livePosition?: { x: number; y: number };
 }
 
 export interface GiftEvent {
@@ -49,8 +53,8 @@ export interface LeaderboardEntry {
 
 export interface StreamConfig {
   channelName: string;
-  liveTitle: string; // "TÂM TỊNH TÂM AN"
-  subTitle: string; // 'Gõ "adidaphat" để vào lễ Phật'
+  liveTitle: string; // legacy field retained for scene compatibility
+  subTitle: string;
   isConnected: boolean;
   autoTts: boolean;
   voiceGender: 'female' | 'male'; // Giọng Nữ Phật Giáo (Default) vs Giọng Nam
@@ -78,6 +82,31 @@ export interface CommentEvent {
   category?: 'peace' | 'wealth' | 'family' | 'health' | 'love' | 'general';
 }
 
+export interface ChatMessage {
+  id: string;
+  name: string;
+  text: string;
+  createdAt: number;
+}
+
+export interface OnlineVisitor {
+  id: string;
+  name: string;
+  x?: number;
+  y?: number;
+}
+
+export interface TempleAction {
+  id: string;
+  visitorId: string;
+  name: string;
+  kind: 'prayer' | 'offering' | 'reaction';
+  choice?: 'incense' | 'lotus' | 'candle';
+  reaction?: ReactionEmoji;
+  text?: string;
+  createdAt: number;
+}
+
 export interface AiTrendReport {
   sentimentSummary: string;
   prayerBreakdown: {
@@ -93,17 +122,7 @@ export interface AiTrendReport {
   timestamp: number;
 }
 
-export interface TikTokLiveStatus {
-  isConnected: boolean;
-  isConnecting: boolean;
-  username: string;
-  roomId?: string;
-  viewerCount?: number;
-  totalLikes?: number;
-  error?: string;
-}
-
-// Someone who should walk up and offer incense: sent by a gift or an "adidaphat" comment
+// Someone who should walk up and offer incense in the interactive hall.
 export interface OfferRequest {
   id: string;
   username: string;

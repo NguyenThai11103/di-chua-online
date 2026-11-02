@@ -2,344 +2,340 @@ import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import fs from 'fs';
-import { TikTokLiveConnection, WebcastEvent, ControlEvent } from 'tiktok-live-connector';
+import { randomUUID } from 'crypto';
+import { createClient } from 'redis';
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 
+dotenv.config({ path: '.env.local' });
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const PORT = process.env.PORT ? Number.parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json());
 app.use('/assets', express.static(path.join(__dirname, 'public', 'assets')));
 
-// TikTok LIVE Integration State
-interface TikTokStats {
-  isConnected: boolean;
-  isConnecting: boolean;
-  username: string;
-  roomId: string;
-  viewerCount: number;
-  totalLikes: number;
-  error?: string;
+interface ChatMessage {
+  id: string;
+  name: string;
+  text: string;
+  createdAt: number;
 }
 
-let activeTikTokConn: InstanceType<typeof TikTokLiveConnection> | null = null;
-let sseClients: express.Response[] = [];
-let liveStats: TikTokStats = {
-  isConnected: false,
-  isConnecting: false,
-  username: '',
-  roomId: '',
-  viewerCount: 0,
-  totalLikes: 0,
-  error: '',
+interface VisitorPresence {
+  id: string;
+  name: string;
+  lastSeen: number;
+  x?: number;
+  y?: number;
+}
+
+interface TempleAction {
+  id: string;
+  visitorId: string;
+  name: string;
+  kind: 'prayer' | 'offering' | 'reaction';
+  choice?: 'incense' | 'lotus' | 'candle';
+  reaction?: '🙏' | '👋' | '🪷' | '❤️';
+  text?: string;
+  createdAt: number;
+}
+
+type RedisClient = ReturnType<typeof createClient>;
+
+const INSTANCE_ID = randomUUID();
+const EVENT_CHANNEL = 'temple:events';
+const CHAT_MESSAGES_KEY = 'temple:chat:messages';
+const PRESENCE_KEY = 'temple:presence';
+const PRESENCE_NAMES_KEY = 'temple:presence:names';
+const PRESENCE_POSITIONS_KEY = 'temple:presence:positions';
+const PRESENCE_TTL_MS = 45_000;
+
+const localMessages: ChatMessage[] = [];
+const localVisitors = new Map<string, VisitorPresence>();
+const localRateLimit = new Map<string, number[]>();
+const eventClients = new Set<express.Response>();
+
+let redisPromise: Promise<RedisClient> | null = null;
+let subscriberPromise: Promise<RedisClient> | null = null;
+
+const getRedis = (): Promise<RedisClient> | null => {
+  if (!process.env.REDIS_URL) return null;
+  if (!redisPromise) {
+    const client = createClient({ url: process.env.REDIS_URL });
+    client.on('error', (error) => console.error('Redis error:', error));
+    redisPromise = client.connect().then(() => client);
+  }
+  return redisPromise;
 };
 
-function broadcastSSE(eventType: string, data: unknown) {
-  const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
-  sseClients.forEach((client) => {
+const cleanText = (value: unknown, maxLength: number) =>
+  String(value ?? '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+
+const broadcastLocal = (event: string, data: unknown) => {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  eventClients.forEach((client) => client.write(payload));
+};
+
+const ensureSubscriber = async () => {
+  const clientPromise = getRedis();
+  if (!clientPromise || subscriberPromise) return subscriberPromise;
+  subscriberPromise = clientPromise.then(async (client) => {
+    const subscriber = client.duplicate();
+    subscriber.on('error', (error) => console.error('Redis subscriber error:', error));
+    await subscriber.connect();
+    await subscriber.subscribe(EVENT_CHANNEL, (raw) => {
+      try {
+        const payload = JSON.parse(raw) as { origin?: string; event?: string; data?: unknown };
+        if (payload.origin !== INSTANCE_ID && payload.event) broadcastLocal(payload.event, payload.data);
+      } catch (error) {
+        console.warn('Ignored malformed Redis event:', error);
+      }
+    });
+    return subscriber;
+  });
+  return subscriberPromise;
+};
+
+const publishEvent = async (event: string, data: unknown) => {
+  broadcastLocal(event, data);
+  const redis = await getRedis();
+  if (redis) await redis.publish(EVENT_CHANNEL, JSON.stringify({ origin: INSTANCE_ID, event, data }));
+};
+
+const readMessages = async (): Promise<ChatMessage[]> => {
+  const redis = await getRedis();
+  if (!redis) return localMessages;
+  const rows = await redis.lRange(CHAT_MESSAGES_KEY, 0, -1);
+  return rows.flatMap((row) => {
     try {
-      client.write(payload);
+      return [JSON.parse(row) as ChatMessage];
     } catch {
-      // client disconnected
+      return [];
     }
   });
-}
+};
 
-// TikTok Live SSE Stream
-app.get('/api/tiktok/events', (req, res) => {
+const saveMessage = async (message: ChatMessage) => {
+  const redis = await getRedis();
+  if (!redis) {
+    localMessages.push(message);
+    if (localMessages.length > 100) localMessages.shift();
+    return;
+  }
+  await redis.rPush(CHAT_MESSAGES_KEY, JSON.stringify(message));
+  await redis.lTrim(CHAT_MESSAGES_KEY, -100, -1);
+};
+
+const checkRateLimit = async (ip: string) => {
+  const redis = await getRedis();
+  if (!redis) {
+    const now = Date.now();
+    const recent = (localRateLimit.get(ip) ?? []).filter((timestamp) => now - timestamp < 60_000);
+    if (recent.length >= 12) return false;
+    recent.push(now);
+    localRateLimit.set(ip, recent);
+    return true;
+  }
+  const key = `temple:chat:rate:${ip}`;
+  const count = await redis.incr(key);
+  if (count === 1) await redis.expire(key, 60);
+  return count <= 12;
+};
+
+const readOnlineVisitors = async (): Promise<{
+  visitors: Array<{ id: string; name: string; x?: number; y?: number }>;
+  removed: boolean;
+}> => {
+  const redis = await getRedis();
+  const cutoff = Date.now() - PRESENCE_TTL_MS;
+  if (!redis) {
+    let removed = false;
+    localVisitors.forEach((visitor, id) => {
+      if (visitor.lastSeen < cutoff) {
+        localVisitors.delete(id);
+        removed = true;
+      }
+    });
+    return {
+      visitors: [...localVisitors.values()].map(({ id, name, x, y }) => ({ id, name, x, y })),
+      removed,
+    };
+  }
+
+  const expired = await redis.zRangeByScore(PRESENCE_KEY, 0, cutoff);
+  if (expired.length) {
+    await redis.zRem(PRESENCE_KEY, expired);
+    await redis.hDel(PRESENCE_NAMES_KEY, expired);
+    await redis.hDel(PRESENCE_POSITIONS_KEY, expired);
+  }
+  const ids = await redis.zRangeByScore(PRESENCE_KEY, cutoff + 1, '+inf');
+  const names = ids.length ? await redis.hmGet(PRESENCE_NAMES_KEY, ids) : [];
+  const positions = ids.length ? await redis.hmGet(PRESENCE_POSITIONS_KEY, ids) : [];
+  return {
+    visitors: ids.map((id, index) => {
+      let position: { x?: number; y?: number } = {};
+      try {
+        position = positions[index] ? JSON.parse(positions[index]!) : {};
+      } catch {
+        position = {};
+      }
+      return { id, name: names[index] || 'Người hữu duyên', ...position };
+    }),
+    removed: expired.length > 0,
+  };
+};
+
+const publishPresence = async () => {
+  const { visitors } = await readOnlineVisitors();
+  await publishEvent('presence', { visitors });
+  return visitors;
+};
+
+app.get('/api/chat/messages', async (_req, res) => res.json({ messages: await readMessages() }));
+
+app.get('/api/chat/events', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
+  eventClients.add(res);
+  await ensureSubscriber();
+  const { visitors } = await readOnlineVisitors();
+  res.write(': connected\n\n');
+  res.write(`event: presence\ndata: ${JSON.stringify({ visitors })}\n\n`);
 
-  // Send current status right away
-  res.write(`event: status\ndata: ${JSON.stringify(liveStats)}\n\n`);
-  if (lastRateControl) res.write(`event: control\ndata: ${JSON.stringify(lastRateControl)}\n\n`);
-
-  if (lastNameControl) res.write(`event: control\ndata: ${JSON.stringify(lastNameControl)}\n\n`);
-  sseClients.push(res);
-
-  // Keep-alive heartbeat every 20s
-  const heartbeat = setInterval(() => {
-    try {
-      res.write(': keep-alive\n\n');
-    } catch {
-      clearInterval(heartbeat);
-    }
-  }, 20000);
-
+  const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 20_000);
   req.on('close', () => {
     clearInterval(heartbeat);
-    sseClients = sseClients.filter((c) => c !== res);
+    eventClients.delete(res);
   });
 });
 
-// TikTok Live Current Status
-app.get('/api/tiktok/status', (_req, res) => {
-  return res.json({ success: true, data: liveStats });
+app.post('/api/visitors/join', async (req, res) => {
+  const id = cleanText(req.body?.id, 64);
+  const name = cleanText(req.body?.name, 36);
+  if (!id || !name) return res.status(400).json({ error: 'Thiếu thông tin người tham gia.' });
+  const redis = await getRedis();
+  if (redis) {
+    await redis.zAdd(PRESENCE_KEY, { score: Date.now(), value: id });
+    await redis.hSet(PRESENCE_NAMES_KEY, id, name);
+  } else {
+    localVisitors.set(id, { ...localVisitors.get(id), id, name, lastSeen: Date.now() });
+  }
+  return res.json({ visitors: await publishPresence() });
 });
 
-// Connect to TikTok Live room by username
-app.post('/api/tiktok/connect', async (req, res) => {
-  const { username } = req.body;
-  if (!username || typeof username !== 'string') {
-    return res.status(400).json({ success: false, error: 'Thiếu tên tài khoản TikTok (username)' });
-  }
-
-  const cleanUser = username.replace(/^@/, '').trim();
-  if (!cleanUser) {
-    return res.status(400).json({ success: false, error: 'Tên tài khoản không hợp lệ' });
-  }
-
-  try {
-    // If already connected to another room, disconnect first
-    if (activeTikTokConn) {
-      try {
-        activeTikTokConn.disconnect();
-      } catch {
-        // ignore
-      }
-      activeTikTokConn = null;
+app.post('/api/visitors/heartbeat', async (req, res) => {
+  const id = cleanText(req.body?.id, 64);
+  const name = cleanText(req.body?.name, 36);
+  const redis = await getRedis();
+  if (redis) {
+    if (id) {
+      await redis.zAdd(PRESENCE_KEY, { score: Date.now(), value: id });
+      if (name) await redis.hSet(PRESENCE_NAMES_KEY, id, name);
     }
-
-    liveStats = {
-      isConnected: false,
-      isConnecting: true,
-      username: cleanUser,
-      roomId: '',
-      viewerCount: 0,
-      totalLikes: 0,
-      error: '',
-    };
-    broadcastSSE('status', liveStats);
-
-    const conn = new TikTokLiveConnection(cleanUser, {
-      processInitialData: true,
-      // The gift-list fetch behind this option needs a paid Euler Stream plan; gift events already carry name and diamonds
-      enableExtendedGiftInfo: false,
-    });
-
-    conn.on(ControlEvent.CONNECTED, (state: { roomId?: string }) => {
-      console.log(`[TikTok LIVE] Connected to @${cleanUser}, room ID: ${state?.roomId}`);
-      liveStats = {
-        isConnected: true,
-        isConnecting: false,
-        username: cleanUser,
-        roomId: state?.roomId || '',
-        viewerCount: liveStats.viewerCount,
-        totalLikes: liveStats.totalLikes,
-        error: '',
-      };
-      broadcastSSE('status', liveStats);
-      broadcastSSE('connected', { username: cleanUser, roomId: state?.roomId });
-    });
-
-    conn.on(ControlEvent.DISCONNECTED, () => {
-      console.log(`[TikTok LIVE] Disconnected from @${cleanUser}`);
-      liveStats.isConnected = false;
-      liveStats.isConnecting = false;
-      broadcastSSE('status', liveStats);
-      broadcastSSE('disconnected', { username: cleanUser });
-    });
-
-    conn.on(WebcastEvent.STREAM_END, () => {
-      console.log(`[TikTok LIVE] Stream ended for @${cleanUser}`);
-      liveStats.isConnected = false;
-      liveStats.isConnecting = false;
-      liveStats.error = 'Phiên Live trên TikTok đã kết thúc';
-      broadcastSSE('status', liveStats);
-      broadcastSSE('streamEnd', { username: cleanUser });
-    });
-
-    conn.on(WebcastEvent.CHAT, (data: any) => {
-      const chatEvent = {
-        username: data?.user?.displayId || data?.user?.uniqueId || data?.uniqueId || 'devotee',
-        nickname: data?.user?.nickname || data?.nickname || data?.uniqueId || 'Phật tử',
-        // tiktok-live-proto v3 puts the text in `content` (v1 used `comment`)
-        comment: data?.content || data?.comment || '',
-        avatar: data?.user?.avatarThumb?.urlList?.[0] || "",
-        timestamp: Date.now(),
-      };
-      broadcastSSE('chat', chatEvent);
-    });
-
-    // TikTok resends streak gifts with a cumulative repeatCount; only forward the new units
-    const streakCounts = new Map<string, number>();
-
-    conn.on(WebcastEvent.GIFT, (data: any) => {
-      const username = data?.user?.displayId || data?.user?.uniqueId || data?.uniqueId || 'devotee';
-      const giftId = data?.giftId || 0;
-      const streakKey = `${username}_${giftId}`;
-      const total = data?.repeatCount || 1;
-      const delta = total - (streakCounts.get(streakKey) || 0);
-      const isStreakable = (data?.gift?.type ?? data?.giftDetails?.giftType ?? data?.giftType) === 1;
-      if (isStreakable && !data?.repeatEnd) streakCounts.set(streakKey, total);
-      else streakCounts.delete(streakKey);
-      if (delta <= 0) return;
-
-      const giftEvent = {
-        username,
-        nickname: data?.user?.nickname || data?.nickname || data?.uniqueId || 'Thí chủ',
-        giftName: data?.gift?.name || data?.giftDetails?.giftName || data?.giftName || 'Hoa Sen',
-        giftId,
-        diamondCount: data?.gift?.diamondCount || data?.diamondCount || data?.giftDetails?.diamondCount || 1,
-        repeatCount: delta,
-        repeatEnd: data?.repeatEnd ?? 1,
-        avatar: data?.user?.avatarThumb?.urlList?.[0] || "",
-        timestamp: Date.now(),
-      };
-      broadcastSSE('gift', giftEvent);
-    });
-
-    conn.on(WebcastEvent.MEMBER, (data: any) => {
-      const memberEvent = {
-        username: data?.user?.displayId || data?.user?.uniqueId || data?.uniqueId || 'devotee',
-        nickname: data?.user?.nickname || data?.nickname || data?.uniqueId || 'Phật tử',
-        avatar: data?.user?.avatarThumb?.urlList?.[0] || "",
-        timestamp: Date.now(),
-      };
-      broadcastSSE('member', memberEvent);
-    });
-
-    conn.on(WebcastEvent.FOLLOW, (data: any) => {
-      broadcastSSE('follow', {
-        username: data?.user?.displayId || data?.user?.uniqueId || data?.uniqueId || 'devotee',
-        nickname: data?.user?.nickname || data?.nickname || data?.uniqueId || 'Phật tử',
-        timestamp: Date.now(),
-      });
-    });
-
-    conn.on(WebcastEvent.ROOM_USER, (data: any) => {
-      if (typeof data?.viewerCount === 'number') {
-        liveStats.viewerCount = data.viewerCount;
-        broadcastSSE('roomUser', { viewerCount: data.viewerCount });
-      }
-    });
-
-    conn.on(WebcastEvent.LIKE, (data: any) => {
-      if (typeof data?.totalLikeCount === 'number') {
-        liveStats.totalLikes = data.totalLikeCount;
-      }
-      broadcastSSE('like', {
-        username: data?.user?.displayId || data?.user?.uniqueId || data?.uniqueId || '',
-        likeCount: data?.likeCount || 1,
-        totalLikes: liveStats.totalLikes,
-      });
-    });
-
-    conn.on(ControlEvent.ERROR, (err: unknown) => {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      console.warn(`[TikTok LIVE] Error for @${cleanUser}:`, errMsg);
-      liveStats.error = errMsg;
-      broadcastSSE('status', liveStats);
-    });
-
-    activeTikTokConn = conn;
-
-    // Connect to room (note: user might not be live right now)
-    conn
-      .connect()
-      .then((state: { roomId?: string }) => {
-        return res.json({
-          success: true,
-          message: `Đang kết nối phòng live @${cleanUser}`,
-          roomId: state.roomId,
-        });
-      })
-      .catch((err: unknown) => {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        console.error(`[TikTok LIVE] Connect error for @${cleanUser}:`, errMsg);
-        liveStats.isConnecting = false;
-        liveStats.isConnected = false;
-        liveStats.error = errMsg;
-        broadcastSSE('status', liveStats);
-        return res.status(400).json({
-          success: false,
-          error: `Không thể kết nối với @${cleanUser}: ${errMsg}. Hãy đảm bảo tài khoản đang bấm Phát trực tiếp (LIVE) trên TikTok!`,
-        });
-      });
-  } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    liveStats.isConnecting = false;
-    liveStats.isConnected = false;
-    liveStats.error = errMsg;
-    broadcastSSE('status', liveStats);
-    return res.status(500).json({ success: false, error: errMsg });
+  } else {
+    const visitor = localVisitors.get(id);
+    if (visitor) Object.assign(visitor, { lastSeen: Date.now(), name: name || visitor.name });
   }
+  const online = await readOnlineVisitors();
+  if (online.removed) await publishEvent('presence', { visitors: online.visitors });
+  return res.status(204).end();
 });
 
-// Streamer commands from the dashboard, relayed to the live stage page(s) that make the sound
-const CONTROL_ACTIONS = ['speak', 'shareReminder', 'bell', 'setRate', 'setName'];
+app.post('/api/visitors/move', async (req, res) => {
+  const id = cleanText(req.body?.id, 64);
+  const x = Math.min(88, Math.max(12, Number(req.body?.x)));
+  const y = Math.min(96, Math.max(68, Number(req.body?.y)));
+  if (!id || !Number.isFinite(x) || !Number.isFinite(y)) {
+    return res.status(400).json({ error: 'Tọa độ di chuyển không hợp lệ.' });
+  }
+  const redis = await getRedis();
+  if (redis) {
+    const movement = { id, x, y };
+    broadcastLocal('movement', movement);
+    await redis
+      .multi()
+      .zAdd(PRESENCE_KEY, { score: Date.now(), value: id })
+      .hSet(PRESENCE_POSITIONS_KEY, id, JSON.stringify({ x, y }))
+      .publish(EVENT_CHANNEL, JSON.stringify({ origin: INSTANCE_ID, event: 'movement', data: movement }))
+      .exec();
+  } else {
+    const visitor = localVisitors.get(id);
+    if (visitor) Object.assign(visitor, { x, y, lastSeen: Date.now() });
+    broadcastLocal('movement', { id, x, y });
+  }
+  return res.status(204).end();
+});
 
-// The channel name (title + what the voice says) survives restarts in settings.json next to this file
-const SETTINGS_FILE = path.join(process.cwd(), 'settings.json');
-let lastNameControl: { action: string; text: string } | null = null;
-try {
-  const saved = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
-  if (typeof saved.channelName === 'string' && saved.channelName.trim()) lastNameControl = { action: 'setName', text: saved.channelName.trim() };
-} catch {
-  // no settings yet: the app's default name is used
-}
-// Last voice speed from the dashboard, replayed to stage pages that (re)load later
-let lastRateControl: { action: string; text: string } | null = null;
-app.post('/api/control', (req, res) => {
-  const { action, text } = req.body || {};
-  if (!CONTROL_ACTIONS.includes(action)) {
-    return res.status(400).json({ success: false, error: 'Lệnh không hợp lệ' });
-  }
-  if (action === 'speak' && (typeof text !== 'string' || !text.trim())) {
-    return res.status(400).json({ success: false, error: 'Chưa nhập nội dung cần đọc' });
-  }
-  const payload = { action, text: typeof text === 'string' ? text.trim().slice(0, 1000) : undefined };
-  if (action === 'setRate' && payload.text) lastRateControl = { action, text: payload.text };
-  if (action === 'setName') {
-    // Plain name only: no control characters, at most 40 characters
-    const name = (payload.text || '').replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 40);
-    if (!name) return res.status(400).json({ success: false, error: 'Chưa nhập tên kênh' });
-    payload.text = name;
-    lastNameControl = { action, text: name };
-    try {
-      fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ channelName: name }, null, 2));
-    } catch (err) {
-      console.error('Could not save settings.json:', err);
+app.post('/api/visitors/leave', async (req, res) => {
+  const id = cleanText(req.body?.id, 64);
+  const redis = await getRedis();
+  if (redis) {
+    if (id) {
+      await redis.zRem(PRESENCE_KEY, id);
+      await redis.hDel(PRESENCE_NAMES_KEY, id);
+      await redis.hDel(PRESENCE_POSITIONS_KEY, id);
     }
+  } else if (id) {
+    localVisitors.delete(id);
   }
-  broadcastSSE('control', payload);
-  return res.json({ success: true, stages: sseClients.length });
+  await publishPresence();
+  return res.status(204).end();
 });
 
-// Disconnect route
-app.post('/api/tiktok/disconnect', (_req, res) => {
-  try {
-    if (activeTikTokConn) {
-      activeTikTokConn.disconnect();
-      activeTikTokConn = null;
-    }
-    liveStats = {
-      isConnected: false,
-      isConnecting: false,
-      username: '',
-      roomId: '',
-      viewerCount: 0,
-      totalLikes: 0,
-      error: '',
-    };
-    broadcastSSE('status', liveStats);
-    return res.json({ success: true, message: 'Đã ngắt kết nối TikTok LIVE' });
-  } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    return res.status(500).json({ success: false, error: errMsg });
+app.post('/api/chat/messages', async (req, res) => {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  if (!(await checkRateLimit(ip))) {
+    return res.status(429).json({ error: 'Bạn gửi hơi nhanh. Vui lòng chờ một chút.' });
   }
+  const name = cleanText(req.body?.name, 36) || 'Người hữu duyên';
+  const text = cleanText(req.body?.text, 300);
+  if (!text) return res.status(400).json({ error: 'Tin nhắn không được để trống.' });
+  const message: ChatMessage = { id: randomUUID(), name, text, createdAt: Date.now() };
+  await saveMessage(message);
+  await publishEvent('message', message);
+  return res.status(201).json({ message });
 });
 
+app.post('/api/temple/actions', async (req, res) => {
+  const id = cleanText(req.body?.id, 64);
+  const visitorId = cleanText(req.body?.visitorId, 64);
+  const name = cleanText(req.body?.name, 36);
+  const kind = cleanText(req.body?.kind, 16);
+  const choice = cleanText(req.body?.choice, 16);
+  const reaction = cleanText(req.body?.reaction, 8);
+  const text = cleanText(req.body?.text, 180);
+  if (!id || !visitorId || !name || !['prayer', 'offering', 'reaction'].includes(kind)) {
+    return res.status(400).json({ error: 'Tương tác không hợp lệ.' });
+  }
+  if (kind === 'offering' && !['incense', 'lotus', 'candle'].includes(choice)) {
+    return res.status(400).json({ error: 'Nghi thức không hợp lệ.' });
+  }
+  if (kind === 'reaction' && !['🙏', '👋', '🪷', '❤️'].includes(reaction)) {
+    return res.status(400).json({ error: 'Biểu tượng tương tác không hợp lệ.' });
+  }
+  const action: TempleAction = {
+    id,
+    visitorId,
+    name,
+    kind: kind as TempleAction['kind'],
+    choice: kind === 'offering' ? (choice as TempleAction['choice']) : undefined,
+    reaction: kind === 'reaction' ? (reaction as TempleAction['reaction']) : undefined,
+    text: kind === 'prayer' ? text : undefined,
+    createdAt: Date.now(),
+  };
+  await publishEvent('temple-action', action);
+  return res.status(202).json({ action });
+});
 
-// Split at sentence/comma/space boundaries into pieces of at most `max` chars
 function splitTtsText(text: string, max = 190): string[] {
   const chunks: string[] = [];
   let rest = text.trim();
@@ -356,22 +352,26 @@ function splitTtsText(text: string, max = 190): string[] {
   return chunks;
 }
 
-// Natural Vietnamese neural voice; rate 1 = normal speed. Samples to compare are in giong-mau/
-const TTS_VOICE = 'vi-VN-NamMinhNeural'; // male voice, chosen from giong-mau/4
-const TTS_PITCH = '-4%'; // slightly deeper, calmer
-// The text goes inside SSML, so names with & < > must be escaped
-const escapeXml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const TTS_VOICE = 'vi-VN-NamMinhNeural';
+const TTS_PITCH = '-4%';
+const escapeXml = (value: string) =>
+  value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 async function edgeTts(text: string, rate: number): Promise<Buffer> {
   const tts = new MsEdgeTTS();
   try {
     await tts.setMetadata(TTS_VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
-    const { audioStream } = tts.toStream(escapeXml(text), { rate: `${Math.round((rate - 1) * 100)}%`, pitch: TTS_PITCH });
+    const { audioStream } = tts.toStream(escapeXml(text), {
+      rate: `${Math.round((rate - 1) * 100)}%`,
+      pitch: TTS_PITCH,
+    });
     const chunks: Buffer[] = [];
     const read = (async () => {
-      for await (const c of audioStream) chunks.push(c as Buffer);
+      for await (const chunk of audioStream) chunks.push(chunk as Buffer);
     })();
-    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Edge TTS timeout')), 20000));
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Edge TTS timeout')), 20_000)
+    );
     await Promise.race([read, timeout]);
     if (chunks.length === 0) throw new Error('Edge TTS returned no audio');
     return Buffer.concat(chunks);
@@ -380,15 +380,13 @@ async function edgeTts(text: string, rate: number): Promise<Buffer> {
   }
 }
 
-// Fallback: Google Translate TTS caps each request near 200 chars, so fetch in chunks and join the MP3s
 async function googleTts(text: string): Promise<Buffer> {
   const parts: Buffer[] = [];
   for (const chunk of splitTtsText(text)) {
-    const googleTtsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&tl=vi&client=tw-ob&q=${encodeURIComponent(chunk)}`;
-    const response = await fetch(googleTtsUrl, {
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&tl=vi&client=tw-ob&q=${encodeURIComponent(chunk)}`;
+    const response = await fetch(url, {
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
         Referer: 'https://translate.google.com/',
       },
     });
@@ -398,64 +396,46 @@ async function googleTts(text: string): Promise<Buffer> {
   return Buffer.concat(parts);
 }
 
-// Repeated lines (share reminders, lecture paragraphs) are served from memory
 const ttsCache = new Map<string, Buffer>();
 
 app.get('/api/tts', async (req, res) => {
   try {
     const text = ((req.query.text as string) || '').trim().slice(0, 1500);
-    if (!text) {
-      return res.status(400).send('Missing text parameter');
-    }
+    if (!text) return res.status(400).send('Missing text parameter');
     const rate = Math.min(1.5, Math.max(0.5, Number(req.query.rate) || 1));
     const cacheKey = `${rate}|${text}`;
     let audio = ttsCache.get(cacheKey);
     if (!audio) {
       try {
         audio = await edgeTts(text, rate);
-      } catch (err) {
-        console.warn('Edge TTS failed, falling back to Google:', err instanceof Error ? err.message : err);
+      } catch (error) {
+        console.warn('Edge TTS failed, falling back to Google:', error instanceof Error ? error.message : error);
         audio = await googleTts(text);
       }
       ttsCache.set(cacheKey, audio);
       if (ttsCache.size > 200) ttsCache.delete(ttsCache.keys().next().value!);
     }
-
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Cache-Control', 'public, max-age=86400');
     return res.send(audio);
-  } catch (err) {
-    console.error('TTS error:', err);
+  } catch (error) {
+    console.error('TTS error:', error);
     return res.status(500).json({ error: 'TTS failed' });
   }
 });
 
-// API Route: AI Real-Time Prayer & Trend Analysis
-
-// Setup Vite middleware in dev or static files in production
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      // LIVE_MODE=1 (BAT-LIVE.bat): no hot reload, so editing code or a dropped dev socket never reloads the
-      // stage page mid-live. Refresh the Link source by hand to pick up changes.
-      server: { middlewareMode: true, hmr: process.env.LIVE_MODE === '1' ? false : undefined },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.join(__dirname, 'dist')));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-    });
+    app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'dist', 'index.html')));
   }
-
-  // Loopback only: the dashboard, the stage page and LIVE Studio all run on this computer (lvh.me resolves to
-  // 127.0.0.1). Listening on every interface let anyone on the same Wi-Fi make the live voice say anything via
-  // /api/control, switch the TikTok room, or use the TTS route. The API has no login, so keep it local.
-  app.listen(PORT, '127.0.0.1', () => {
-    console.log(`Chùa Online LIVE server running on http://localhost:${PORT}`);
-  });
+  app.listen(PORT, '0.0.0.0', () => console.log(`Đi Chùa Online đang chạy tại http://localhost:${PORT}`));
 }
 
-startServer();
+if (process.env.VERCEL !== '1') startServer();
+
+export default app;

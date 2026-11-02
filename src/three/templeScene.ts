@@ -17,14 +17,33 @@ export type ActorSpec = {
   enter: 'walk' | 'place'; // walk in from the bottom of the aisle, or appear already kneeling
   offer?: string; // a gift id: go up and offer incense once for it, then come back to `at`
   leave?: boolean; // after offering, walk out down the aisle instead of kneeling at `at` (not a top-10 donor)
-  label?: { name: string; avatar?: string }; // name plate that follows them while they go up to offer incense
+  scale?: number;
+  facesCamera?: boolean;
+  canBow?: boolean;
+  label?: { name: string; avatar?: string; message?: string; reaction?: string; always?: boolean }; // label and chat bubble that follow an offerer
 };
 
-// Bronze name plate (same look as the 2D ones) built with DOM APIs; the name is viewer text, so textContent only
-function makeNamePlate(label: { name: string; avatar?: string }) {
+// Bronze name plate and optional chat bubble built with DOM APIs; viewer text always uses textContent.
+function makeNamePlate(label: { name: string; avatar?: string; message?: string; reaction?: string; always?: boolean }) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'absolute -translate-x-1/2 -translate-y-full flex flex-col items-center gap-1 pointer-events-none';
+  if (label.reaction) {
+    const reaction = document.createElement('div');
+    reaction.className =
+      'grid size-9 place-items-center rounded-full border border-amber-200/50 bg-[#201108]/90 text-2xl shadow-[0_4px_16px_rgba(0,0,0,0.55)] animate-bounce';
+    reaction.textContent = label.reaction;
+    wrapper.appendChild(reaction);
+  }
+  if (label.message) {
+    const bubble = document.createElement('div');
+    bubble.className =
+      'w-max max-w-[140px] rounded-xl rounded-bl-sm border border-[#d9a55a]/70 bg-[#201108]/92 px-2 py-1 text-center text-[9px] font-semibold leading-tight text-[#fff2cf] shadow-[0_4px_14px_rgba(0,0,0,0.5)]';
+    bubble.textContent = label.message;
+    wrapper.appendChild(bubble);
+  }
   const el = document.createElement('div');
   el.className =
-    'absolute -translate-x-1/2 -translate-y-full flex items-center gap-1 w-max max-w-[120px] pl-0.5 pr-1.5 rounded-full border border-[#d9a55a] bg-linear-to-b from-[#5a3413] to-[#2a1608] shadow-[0_0_8px_rgba(217,165,90,0.45)] text-[9px] font-temple pointer-events-none';
+    'flex items-center gap-1 w-max max-w-[120px] pl-0.5 pr-1.5 rounded-full border border-[#d9a55a] bg-linear-to-b from-[#5a3413] to-[#2a1608] shadow-[0_0_8px_rgba(217,165,90,0.45)] text-[9px] font-temple';
   if (label.avatar) {
     const img = document.createElement('img');
     img.src = label.avatar;
@@ -41,7 +60,8 @@ function makeNamePlate(label: { name: string; avatar?: string }) {
   name.className = 'truncate font-semibold text-[#fbe7b8] leading-[14px]';
   name.textContent = label.name;
   el.appendChild(name);
-  return el;
+  wrapper.appendChild(el);
+  return wrapper;
 }
 
 type Clips = {
@@ -176,7 +196,7 @@ class Actor {
   private state: 'walking' | 'incense' | 'kneeling' = 'kneeling';
   private hand?: THREE.Object3D;
   head?: THREE.Object3D;
-  label?: { name: string; avatar?: string };
+  label?: { name: string; avatar?: string; message?: string; reaction?: string; always?: boolean };
   plate?: HTMLElement;
   private stick?: THREE.Group;
   // Lạy: spine, chest, neck and head bend forward toward the floor, hold, then come back up
@@ -189,6 +209,8 @@ class Actor {
   private bowsAtBurner = 0;
   private afterBurner?: () => void;
   mode: 'pray' | 'bow' = 'pray';
+  facesCamera = false;
+  canBow = true;
   target = new THREE.Vector3();
 
   constructor(assets: DevoteeAssets) {
@@ -259,11 +281,12 @@ class Actor {
 
   // Kneel facing the altar (away from the camera, so we see their back)
   kneelHere(withKneelDown: boolean) {
-    this.root.rotation.y = Math.PI;
+    this.root.rotation.y = this.facesCamera ? 0 : Math.PI;
     this.state = 'kneeling';
     // Everyone bows over and over on their own clock: a random first start, then a short rest between lạy,
     // so the hall is always bowing but never in unison (0.5-1.5 s rest)
-    this.nextBowIn = Math.random() * 4;
+    this.nextBowIn = this.canBow ? Math.random() * 4 : Number.POSITIVE_INFINITY;
+    if (!this.canBow) this.bowT = -1;
     if (withKneelDown && this.actions.kneelDown) this.play('kneelDown', 0.3);
     else this.play('kneel', 0.3, true);
   }
@@ -347,7 +370,7 @@ class Actor {
         this.onArrive = undefined;
         arrive();
       }
-    } else if (this.state === 'kneeling' && this.current === this.actions.kneel) {
+    } else if (this.canBow && this.state === 'kneeling' && this.current === this.actions.kneel) {
       // Occasional lạy while kneeling; the incense offerer bows over and over
       this.nextBowIn -= dt;
       if (this.nextBowIn <= 0 && this.bowT < 0) {
@@ -534,7 +557,7 @@ export class TempleScene {
     loop();
   }
 
-  // Match the canvas size; render at the on-screen size even when the stage is CSS-zoomed for OBS/LIVE Studio
+  // Match the canvas size and render at the actual on-screen size.
   private resize() {
     const w = this.canvas.clientWidth;
     const h = this.canvas.clientHeight;
@@ -573,6 +596,9 @@ export class TempleScene {
       let actor = this.actors.get(spec.key);
       if (!actor) {
         actor = new Actor(this.assets);
+        actor.root.scale.setScalar(spec.scale ?? 1);
+        actor.facesCamera = spec.facesCamera ?? false;
+        actor.canBow = spec.canBow ?? true;
         actor.mode = spec.mode;
         actor.label = spec.label;
         actor.target.copy(target);
@@ -595,7 +621,18 @@ export class TempleScene {
         continue;
       }
       actor.mode = spec.mode;
-      if (spec.label && (!actor.label || actor.label.name !== spec.label.name || actor.label.avatar !== spec.label.avatar)) {
+      actor.root.scale.setScalar(spec.scale ?? 1);
+      actor.facesCamera = spec.facesCamera ?? false;
+      actor.canBow = spec.canBow ?? true;
+      if (
+        spec.label &&
+        (!actor.label ||
+          actor.label.name !== spec.label.name ||
+          actor.label.avatar !== spec.label.avatar ||
+          actor.label.message !== spec.label.message ||
+          actor.label.reaction !== spec.label.reaction ||
+          actor.label.always !== spec.label.always)
+      ) {
         actor.label = spec.label;
         actor.plate?.remove();
         actor.plate = undefined;
@@ -618,7 +655,7 @@ export class TempleScene {
     if (!this.labelLayer) return;
     const p = new THREE.Vector3();
     for (const a of this.actors.values()) {
-      const show = a.busy && a.root.visible && a.label && a.head;
+      const show = (a.busy || a.label?.always) && a.root.visible && a.label && a.head;
       if (!show) {
         if (a.plate) a.plate.style.display = 'none';
         continue;

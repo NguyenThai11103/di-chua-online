@@ -1,0 +1,6 @@
+.chrome-*/
+.edge-*/
+ui-*.png
+public/assets/bg_original/
+dist/
+coverage/

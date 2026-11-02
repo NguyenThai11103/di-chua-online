@@ -1,64 +1,40 @@
-import React from 'react';
-import { StreamConfig } from '../types/temple';
+import { Flower2, Music2, VolumeX } from 'lucide-react';
 
 interface HeaderNavProps {
-  viewMode: StreamConfig['viewMode'];
-  onChangeViewMode: (mode: StreamConfig['viewMode']) => void;
+  isBgmPlaying: boolean;
+  onToggleBgm: () => void;
 }
 
-export const HeaderNav: React.FC<HeaderNavProps> = ({
-  viewMode,
-  onChangeViewMode,
-}) => {
-  return (
-    <header className="flex items-center justify-between gap-8 px-6 py-3.5 border-b border-stone-800 bg-[#120806]/95 backdrop-blur-md sticky top-0 z-50">
-      {/* Zone 1: Brand Wordmark (Single text element, no badges) */}
-      <div className="flex items-center gap-2 shrink-0">
-        <span className="text-xl">☸</span>
-        <span className="text-lg font-bold tracking-tight text-amber-200 font-temple whitespace-nowrap">
-          Đi Chùa Online
+export const HeaderNav = ({ isBgmPlaying, onToggleBgm }: HeaderNavProps) => (
+  <header className="sticky top-0 z-[180] border-b border-amber-100/10 bg-[#0b0705]/88 backdrop-blur-xl">
+    <div className="mx-auto flex h-16 max-w-[1440px] items-center justify-between gap-4 px-4 sm:px-6 lg:px-10">
+      <a href="#chanh-dien" className="flex min-w-0 items-center gap-2.5" aria-label="Đi Chùa Online - Trang chủ">
+        <span className="grid size-9 shrink-0 place-items-center rounded-full border border-amber-300/25 bg-amber-400/10 text-amber-300">
+          <Flower2 size={18} strokeWidth={1.7} />
         </span>
-      </div>
+        <span className="truncate font-temple text-lg font-semibold text-amber-100 sm:text-xl">Đi Chùa Online</span>
+      </a>
 
-      {/* Zone 2: Navigation Links */}
-      <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-stone-300">
-        <button
-          onClick={() => onChangeViewMode('dual')}
-          className={`hover:text-amber-300 transition-colors whitespace-nowrap ${
-            viewMode === 'dual' ? 'text-amber-400 font-bold' : ''
-          }`}
-        >
-          Chế Độ Kép (Dual View)
-        </button>
-        <button
-          onClick={() => onChangeViewMode('stage_only')}
-          className={`hover:text-amber-300 transition-colors whitespace-nowrap ${
-            viewMode === 'stage_only' ? 'text-amber-400 font-bold' : ''
-          }`}
-        >
-          Màn Hình Sân Khấu (OBS 9:16)
-        </button>
-        <button
-          onClick={() => onChangeViewMode('control_only')}
-          className={`hover:text-amber-300 transition-colors whitespace-nowrap ${
-            viewMode === 'control_only' ? 'text-amber-400 font-bold' : ''
-          }`}
-        >
-          Bảng Điều Khiển Streamer
-        </button>
+      <nav className="hidden items-center gap-7 text-sm text-stone-400 md:flex" aria-label="Điều hướng chính">
+        <a href="#chanh-dien" className="transition hover:text-amber-200">Chánh điện</a>
+        <a href="#gui-loi-nguyen" className="transition hover:text-amber-200">Gửi lời nguyện</a>
+        <a href="#huong-dan" className="transition hover:text-amber-200">Hướng dẫn</a>
       </nav>
 
-      {/* Zone 3: 1 Primary Action */}
-      <div className="flex items-center gap-3 shrink-0">
-        <button
-          onClick={() =>
-            onChangeViewMode(viewMode === 'dual' ? 'stage_only' : 'dual')
-          }
-          className="px-4 py-2 text-xs font-bold text-stone-950 bg-amber-400 hover:bg-amber-300 rounded-lg transition-colors whitespace-nowrap shadow-sm"
-        >
-          {viewMode === 'dual' ? 'Bật Toàn Màn Live (9:16)' : 'Mở Bảng Điều Khiển'}
-        </button>
-      </div>
-    </header>
-  );
-};
+      <button
+        type="button"
+        onClick={onToggleBgm}
+        className={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-2 text-xs font-semibold transition sm:px-4 ${
+          isBgmPlaying
+            ? 'border-amber-300/40 bg-amber-300 text-stone-950'
+            : 'border-amber-100/15 bg-white/5 text-stone-300 hover:border-amber-300/30 hover:text-amber-200'
+        }`}
+        aria-pressed={isBgmPlaying}
+      >
+        {isBgmPlaying ? <Music2 size={15} /> : <VolumeX size={15} />}
+        <span className="hidden sm:inline">{isBgmPlaying ? 'Đang phát nhạc' : 'Bật nhạc thiền'}</span>
+        <span className="sm:hidden">Nhạc</span>
+      </button>
+    </div>
+  </header>
+);

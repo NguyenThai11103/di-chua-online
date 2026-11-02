@@ -4,8 +4,18 @@
 
 @layer base {
   body {
-    @apply antialiased bg-[#0e0705] text-[#f5f0eb] select-none;
+    @apply antialiased bg-[#0e0705] text-[#f5f0eb];
     font-family: 'Be Vietnam Pro', sans-serif;
+    min-width: 320px;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  button,
+  a {
+    -webkit-tap-highlight-color: transparent;
   }
   
   .font-temple {

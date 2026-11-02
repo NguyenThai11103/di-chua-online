@@ -1,7 +1,7 @@
 import React from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 
-// Big name card for the gift giver the camera is following: TikTok avatar and name only
+// Big name card for the visitor the camera is following.
 export const SpotlightCard: React.FC<{ person: { id: string; name: string; avatar?: string } | null }> = ({ person }) => (
   <AnimatePresence>
     {person && (

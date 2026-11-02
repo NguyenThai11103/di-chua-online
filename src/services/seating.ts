@@ -6,7 +6,7 @@ export const SEAT_COUNT = SEATS.length;
 
 /**
  * Seat for a newcomer: the first free seat, or, when the hall is full, the seat of the person
- * who has been quiet the longest. TikTok never reports viewers leaving, so idleness stands in for it.
+ * who has been quiet the longest. Session idleness stands in for leaving the hall.
  */
 export function pickSeat(devotees: Devotee[]): { seat: number; evict?: Devotee } {
   const taken = new Set(devotees.map((d) => d.seat));
